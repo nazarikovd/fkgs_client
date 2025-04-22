@@ -4,7 +4,7 @@
 Как использовать???
 ```javascript
 let fkgs_client = require("fkgs_client.js");
-let FC = new fkgsclient();
+let FC = new fkgs_client();
 
 FC.connect();      // ██████████ 100% Подключено (надеемся, что сервер не сдох)
 
