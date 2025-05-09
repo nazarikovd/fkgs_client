@@ -1,3 +1,4 @@
+const qs = require('querystring'); 
 const axios = require('axios')
 const cheerio = require('cheerio')
 const WebSocket = require('ws')
@@ -30,7 +31,6 @@ module.exports = class FKGSWS {
             return false
         }
     }
-
     async initSession() {
         try {
             const req = await axios.get('https://pos.gosuslugi.ru/lkp/fkgs/', {
@@ -46,11 +46,35 @@ module.exports = class FKGSWS {
             }
             this.csrfToken = csrfToken
             this.sessionCookie = sessionCookie
+
+            await this.changeLocation()
+            
             return true
 
         } catch (error) {
             throw new Error(`Failed to init session: ${error.message}`)
         }
+    }
+
+    //@trick to skip broken centrifugo
+
+    async changeLocation(){
+        let data = qs.stringify({
+            "_csrf": this.csrfToken,
+            "location": "custom_region",
+            "region": "68ba4d184a72297f5a12b5d92d9e272f"
+        })
+        let headers = {
+            'accept': 'application/json, text/javascript, */*; q=0.01',
+            'accept-language': 'ru-RU,ru;q=0.9',
+            'content-type': 'application/x-www-form-urlencoded; charset=UTF-8',
+            'x-csrf-token': this.csrfToken,
+            'x-requested-with': 'XMLHttpRequest',
+            'cookie': `SESSIONID=${this.sessionCookie}`,
+            'Referer': 'https://pos.gosuslugi.ru/lkp/fkgs/'
+        }
+        const loc =  await axios.post('https://pos.gosuslugi.ru/lkp/site/location-change/', data , {headers: headers, withCredentials: true})
+        console.log(loc.data)
     }
 
     initSocket() {
@@ -129,7 +153,7 @@ module.exports = class FKGSWS {
                     this.handleAuthResponse(data)
                     continue
                 }
-
+                console.log(data)
                 this.processMessage(data)
             } catch (error) {
                 console.error('Error parsing message:', raw, error);
@@ -141,12 +165,16 @@ module.exports = class FKGSWS {
     processMessage(data) {
         switch (true) {
             case 'push' in data:
-                this.updateChannelData(
-                    data.push.channel,
-                    data.push.pub.data,
-                    'push'
-                );
-                this.notifySubs(data)
+                const channelId = data.push.channel;
+                const newCount = data.push.pub.data;
+                
+                const existingChannel = this.currentData.channels.find(c => c.id === channelId);
+                
+                if (!existingChannel || existingChannel.count !== newCount) {
+                    this.updateChannelData(channelId, newCount);
+                    this.notifySubs(data);
+                }
+
                 break;
             case 'history' in data:
                 this.updateChannelData(
@@ -178,6 +206,84 @@ module.exports = class FKGSWS {
             count: count
         })
         
+    }
+
+    //@trick to skip broken centrifugo
+
+    async getChannelsHard(){
+        try {
+            await this.initSession()
+            const headers = {
+                'x-csrf-token': this.csrfToken,
+                'cookie': `SESSIONID=${this.sessionCookie}`
+            }
+            const response = await axios.get('https://pos.gosuslugi.ru/lkp/fkgs/?location=m47524000&typeView=&typeView=1&type=&type=2', {headers: headers})
+            const $ = cheerio.load(response.data)
+            const counters = []
+            $('li.proposal-list__item--userless').each((index, element) => {
+                const $el = $(element)
+                const counterSpan = $el.find('[data-ws-counter-id]')
+                const counterId = counterSpan.attr('data-ws-counter-id')
+                const counterValue = counterSpan.text().trim()
+                
+                counters.push({
+                    id: counterId,
+                    count: counterValue
+                })
+            })
+            return {
+                "channels":counters
+            }
+
+        } catch (error) {
+            console.error('Error fetching counters:', error);
+            throw error;
+        }
+    }
+
+    async getCurrentData() {
+        const currentChannels = this.currentData.channels;
+        const hardChannelsData = await this.getChannelsHard();
+        const hardChannels = hardChannelsData.channels;
+    
+        let total = 0
+        const resch = []
+        let websocketStatus = '\nСтатус:\n✅ centrifugo'
+    
+        const hardChannelsMap = new Map(hardChannels.map(ch => [ch.id, ch.count]));
+    
+        for (const currentChannel of currentChannels) {
+            const channelId = currentChannel.id
+            const hardCount = hardChannelsMap.get(channelId) || 0
+            const currentCount = currentChannel.count
+    
+            const finalCount = Math.max(currentCount, hardCount);
+    
+            if (hardCount > currentCount) {
+                websocketStatus = '\nСтатус:\n❌ centrifugo  ✅ gosuslugi';
+                currentChannel.count = hardCount;
+            }
+    
+            total += finalCount;
+    
+            const channelInfo = this.getChannelDisplayInfo(channelId);
+            resch.push(`${channelInfo.emoji} ${channelInfo.name}: ${finalCount}`);
+        }
+    
+        return {
+            total,
+            channels: resch,
+            comment: websocketStatus
+        };
+    }
+    
+    getChannelDisplayInfo(channelId) {
+        const channelsInfo = {
+            "97080": { emoji: "🏥", name: "Металлургов" },
+            "97101": { emoji: "🏘️", name: "Ленина" }
+        };
+    
+        return channelsInfo[channelId] || { emoji: "ℹ️", name: "Unknown" };
     }
 
     initHistoryAndSub() {
